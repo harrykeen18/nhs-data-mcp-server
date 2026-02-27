@@ -2,6 +2,5 @@ node_modules/
 dist/
 .env
 *.tsbuildinfo
-nhs-data.db
 nhs-data.db-wal
 nhs-data.db-shm

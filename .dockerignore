@@ -1,0 +1,8 @@
+node_modules/
+src/
+.git/
+.env
+.claude/
+*.tsbuildinfo
+nhs-data.db-wal
+nhs-data.db-shm
