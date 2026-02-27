@@ -4,8 +4,14 @@ An MCP server providing access to NHS health information — conditions, medicin
 
 ## Connect to the hosted server
 
-Add this to your MCP client config (e.g. Claude Desktop `claude_desktop_config.json`):
+No installation required — the server runs on Fly.io.
 
+**Claude Desktop:** Go to Settings > Connectors and add the server URL:
+```
+https://nhs-mcp-server.fly.dev/mcp
+```
+
+**Claude Code / other MCP clients:** Add to your MCP config:
 ```json
 {
   "mcpServers": {
@@ -16,8 +22,6 @@ Add this to your MCP client config (e.g. Claude Desktop `claude_desktop_config.j
   }
 }
 ```
-
-No installation required — the server runs on Fly.io.
 
 ## Available tools
 
