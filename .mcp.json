@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "nhs": {
+      "command": "npx",
+      "args": ["tsx", "src/index.ts"],
+      "cwd": "/Users/harry/Developement/nhs-data"
+    }
+  }
+}
