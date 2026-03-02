@@ -4,3 +4,4 @@ dist/
 *.tsbuildinfo
 nhs-data.db-wal
 nhs-data.db-shm
+.DS_Store
