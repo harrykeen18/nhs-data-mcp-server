@@ -15,6 +15,7 @@ export function getDb(): Database.Database {
     _db.pragma("journal_mode = WAL");
     _db.pragma("foreign_keys = ON");
     initSchema(_db);
+    migrateIfNeeded(_db);
   }
   return _db;
 }
@@ -52,7 +53,7 @@ function initSchema(db: Database.Database): void {
     );
 
     CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
-      name, description, keywords,
+      name, description, keywords, alternate_names,
       content='pages', content_rowid='id'
     );
 
@@ -63,20 +64,20 @@ function initSchema(db: Database.Database): void {
 
     -- Triggers to keep FTS in sync
     CREATE TRIGGER IF NOT EXISTS pages_ai AFTER INSERT ON pages BEGIN
-      INSERT INTO pages_fts(rowid, name, description, keywords)
-      VALUES (new.id, new.name, new.description, new.keywords);
+      INSERT INTO pages_fts(rowid, name, description, keywords, alternate_names)
+      VALUES (new.id, new.name, new.description, new.keywords, new.alternate_names);
     END;
 
     CREATE TRIGGER IF NOT EXISTS pages_ad AFTER DELETE ON pages BEGIN
-      INSERT INTO pages_fts(pages_fts, rowid, name, description, keywords)
-      VALUES ('delete', old.id, old.name, old.description, old.keywords);
+      INSERT INTO pages_fts(pages_fts, rowid, name, description, keywords, alternate_names)
+      VALUES ('delete', old.id, old.name, old.description, old.keywords, old.alternate_names);
     END;
 
     CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages BEGIN
-      INSERT INTO pages_fts(pages_fts, rowid, name, description, keywords)
-      VALUES ('delete', old.id, old.name, old.description, old.keywords);
-      INSERT INTO pages_fts(rowid, name, description, keywords)
-      VALUES (new.id, new.name, new.description, new.keywords);
+      INSERT INTO pages_fts(pages_fts, rowid, name, description, keywords, alternate_names)
+      VALUES ('delete', old.id, old.name, old.description, old.keywords, old.alternate_names);
+      INSERT INTO pages_fts(rowid, name, description, keywords, alternate_names)
+      VALUES (new.id, new.name, new.description, new.keywords, new.alternate_names);
     END;
 
     CREATE TRIGGER IF NOT EXISTS sections_ai AFTER INSERT ON sections BEGIN
@@ -98,32 +99,113 @@ function initSchema(db: Database.Database): void {
   `);
 }
 
+// --- Migration ---
+
+function migrateIfNeeded(db: Database.Database): void {
+  // Check if pages_fts has 4 columns (name, description, keywords, alternate_names)
+  // by looking for alternate_names in the FTS table schema
+  const ftsCheck = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='pages_fts'"
+  ).get() as { sql: string } | undefined;
+
+  if (ftsCheck && !ftsCheck.sql.includes("alternate_names")) {
+    // Rebuild FTS with the new column: drop old table + triggers, recreate via initSchema
+    db.exec(`
+      DROP TRIGGER IF EXISTS pages_ai;
+      DROP TRIGGER IF EXISTS pages_ad;
+      DROP TRIGGER IF EXISTS pages_au;
+      DROP TABLE IF EXISTS pages_fts;
+
+      CREATE VIRTUAL TABLE pages_fts USING fts5(
+        name, description, keywords, alternate_names,
+        content='pages', content_rowid='id'
+      );
+
+      CREATE TRIGGER pages_ai AFTER INSERT ON pages BEGIN
+        INSERT INTO pages_fts(rowid, name, description, keywords, alternate_names)
+        VALUES (new.id, new.name, new.description, new.keywords, new.alternate_names);
+      END;
+
+      CREATE TRIGGER pages_ad AFTER DELETE ON pages BEGIN
+        INSERT INTO pages_fts(pages_fts, rowid, name, description, keywords, alternate_names)
+        VALUES ('delete', old.id, old.name, old.description, old.keywords, old.alternate_names);
+      END;
+
+      CREATE TRIGGER pages_au AFTER UPDATE ON pages BEGIN
+        INSERT INTO pages_fts(pages_fts, rowid, name, description, keywords, alternate_names)
+        VALUES ('delete', old.id, old.name, old.description, old.keywords, old.alternate_names);
+        INSERT INTO pages_fts(rowid, name, description, keywords, alternate_names)
+        VALUES (new.id, new.name, new.description, new.keywords, new.alternate_names);
+      END;
+
+      -- Backfill FTS from existing data
+      INSERT INTO pages_fts(rowid, name, description, keywords, alternate_names)
+      SELECT id, name, description, keywords, alternate_names FROM pages;
+    `);
+  }
+}
+
 // --- Query helpers ---
 
 export function searchPages(query: string, type?: string): SearchResult[] {
   const db = getDb();
-  // Escape special FTS5 characters and append wildcard
-  const ftsQuery = query.replace(/['"*()]/g, "").trim();
-  if (!ftsQuery) return [];
+  const cleaned = query.replace(/['"*(){}^\-~:]/g, "").trim();
+  if (!cleaned) return [];
 
-  const terms = ftsQuery.split(/\s+/).map(t => `"${t}"*`).join(" ");
+  const terms = cleaned.split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
 
-  let sql = `
+  // Build OR query with prefix matching + phrase bonus
+  const orTerms = terms.map(t => `"${t}"*`).join(" OR ");
+  // If multi-word, boost exact phrase matches
+  const phraseBonus = terms.length > 1 ? ` OR "${terms.join(" ")}"` : "";
+  const ftsQuery = orTerms + phraseBonus;
+
+  const typeFilter = type ? `AND p.type = ?` : "";
+  const params: unknown[] = [ftsQuery];
+  if (type) params.push(type);
+
+  // Tier 1: Search pages_fts
+  const tier1Sql = `
     SELECT p.name, p.slug, p.type, p.description, rank
     FROM pages_fts
     JOIN pages p ON p.id = pages_fts.rowid
     WHERE pages_fts MATCH ?
+    ${typeFilter}
+    ORDER BY rank
+    LIMIT 25
   `;
-  const params: unknown[] = [terms];
+  const tier1 = db.prepare(tier1Sql).all(...params) as SearchResult[];
 
-  if (type) {
-    sql += ` AND p.type = ?`;
-    params.push(type);
+  // Tier 2: If < 10 results, also search sections_fts and map back to pages
+  if (tier1.length < 10) {
+    const sectionParams: unknown[] = [ftsQuery];
+    if (type) sectionParams.push(type);
+
+    const tier2Sql = `
+      SELECT DISTINCT p.name, p.slug, p.type, p.description, sections_fts.rank as rank
+      FROM sections_fts
+      JOIN sections s ON s.id = sections_fts.rowid
+      JOIN pages p ON p.id = s.page_id
+      WHERE sections_fts MATCH ?
+      ${typeFilter}
+      ORDER BY rank
+      LIMIT 25
+    `;
+    const tier2 = db.prepare(tier2Sql).all(...sectionParams) as SearchResult[];
+
+    // Merge, deduplicating by slug
+    const seen = new Set(tier1.map(r => r.slug));
+    for (const r of tier2) {
+      if (!seen.has(r.slug)) {
+        seen.add(r.slug);
+        tier1.push(r);
+      }
+      if (tier1.length >= 25) break;
+    }
   }
 
-  sql += ` ORDER BY rank LIMIT 25`;
-
-  return db.prepare(sql).all(...params) as SearchResult[];
+  return tier1;
 }
 
 export function getPageBySlug(slug: string): PageRow | undefined {
