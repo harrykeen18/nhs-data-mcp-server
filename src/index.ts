@@ -53,8 +53,16 @@ if (transportMode === "http") {
         return;
       }
 
+      if (sessionId && !sessions.has(sessionId)) {
+        // Stale session (machine restarted). Return 404 so the client
+        // knows to re-initialize with a fresh session.
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Session not found. Please reconnect." }, id: null }));
+        return;
+      }
+
       if (req.method === "POST") {
-        // New session
+        // New session (no session ID header)
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
         });
